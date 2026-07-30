@@ -1,18 +1,36 @@
+"""Provider-neutral conversation types and the backend interface.
+
+Everything in this module is deliberately free of any vendor concepts. A live
+model is reached through a `ModelAdapter` in `ztabed/models/`, which implements
+`LLMBackend` and translates these types to and from a provider's wire format.
+"""
 from __future__ import annotations
 
-import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
 from .tools import ToolCallRequest, ToolSpec
 
 
 @dataclass
 class Message:
+    """One turn of a conversation, in provider-neutral form.
+
+    `raw` optionally carries the provider's own representation of an assistant
+    turn. Some providers require their response blocks to be echoed back
+    verbatim on the next request (Anthropic's thinking blocks, for example),
+    so an adapter stores them here and reuses them when the provenance
+    matches. Adapters must fall back to the plain fields when it does not.
+    """
+
     role: str  # "user" | "assistant" | "tool"
     content: str
     name: Optional[str] = None  # tool name, when role == "tool"
+    tool_calls: List[ToolCallRequest] = field(default_factory=list)  # when role == "assistant"
+    tool_call_id: Optional[str] = None  # when role == "tool"; correlates to a ToolCallRequest.call_id
+    is_error: bool = False  # when role == "tool"; the call was denied or failed
+    raw: Any = None  # provider-native payload, tagged with its provenance
 
 
 @dataclass
@@ -24,8 +42,26 @@ class LLMTurnRequest:
 
 @dataclass
 class LLMTurnResponse:
+    """One model turn.
+
+    `tool_call` and `tool_calls` are kept consistent with each other, so a
+    caller that only ever emits or reads a single call (the mock policies) and
+    one that handles parallel calls (the real backends) can share the type.
+    """
+
     text: Optional[str] = None
     tool_call: Optional[ToolCallRequest] = None
+    tool_calls: List[ToolCallRequest] = field(default_factory=list)
+    stop_reason: Optional[str] = None
+    refused: bool = False  # the provider declined the request outright
+    refusal_detail: Optional[str] = None
+    raw: Any = None
+
+    def __post_init__(self) -> None:
+        if self.tool_call is not None and not self.tool_calls:
+            self.tool_calls = [self.tool_call]
+        elif self.tool_calls and self.tool_call is None:
+            self.tool_call = self.tool_calls[0]
 
 
 class LLMBackend(ABC):
@@ -48,62 +84,3 @@ class MockLLM(LLMBackend):
 
     def complete(self, req: LLMTurnRequest) -> LLMTurnResponse:
         return self.policy(req)
-
-
-class ClaudeLLM(LLMBackend):
-    """Real model backend using the Anthropic API.
-
-    Lazily imports `anthropic` so mock-mode runs never require the package
-    or an API key.
-    """
-
-    def __init__(self, model: str = "claude-sonnet-4-6", max_tokens: int = 1024):
-        try:
-            import anthropic
-        except ImportError as exc:
-            raise RuntimeError(
-                "The 'anthropic' package is required for real LLM mode. "
-                "Install it with: pip install anthropic"
-            ) from exc
-
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise RuntimeError("ANTHROPIC_API_KEY environment variable is not set.")
-
-        self._client = anthropic.Anthropic(api_key=api_key)
-        self.model = model
-        self.max_tokens = max_tokens
-
-    def _tool_schema(self, tools: List[ToolSpec]) -> List[dict]:
-        return [
-            {
-                "name": t.name,
-                "description": t.description,
-                "input_schema": {"type": "object", "properties": {}, "additionalProperties": True},
-            }
-            for t in tools
-        ]
-
-    def complete(self, req: LLMTurnRequest) -> LLMTurnResponse:
-        messages = []
-        for m in req.history:
-            if m.role == "tool":
-                messages.append({"role": "user", "content": f"[tool result: {m.name}]\n{m.content}"})
-            else:
-                messages.append({"role": m.role, "content": m.content})
-
-        kwargs = dict(model=self.model, max_tokens=self.max_tokens, system=req.system, messages=messages)
-        if req.tools:
-            kwargs["tools"] = self._tool_schema(req.tools)
-
-        response = self._client.messages.create(**kwargs)
-
-        text_parts = []
-        tool_call = None
-        for block in response.content:
-            if block.type == "text":
-                text_parts.append(block.text)
-            elif block.type == "tool_use":
-                tool_call = ToolCallRequest(name=block.name, arguments=block.input or {})
-
-        return LLMTurnResponse(text="\n".join(text_parts) or None, tool_call=tool_call)

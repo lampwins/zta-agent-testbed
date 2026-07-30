@@ -1,1 +1,3 @@
-anthropic>=0.40.0  # only required for --mode real
+# Only required for --mode real. Each model adapter owns its own SDK dependency;
+# mock mode has none. 0.116+ is needed for output_config (effort) and stop_details.
+anthropic>=0.116.0

@@ -86,6 +86,24 @@ class IntentAuditControl(Control):
         )
         text = (response.text or "").strip()
 
-        if text.upper().startswith("ALLOW"):
+        if _verdict_is_allow(text):
             return PolicyDecision(Decision.ALLOW, text, self.name)
-        return PolicyDecision(Decision.DENY, text or "auditor denied without reason", self.name)
+        return PolicyDecision(Decision.DENY, text or "auditor returned no verdict", self.name)
+
+
+def _verdict_is_allow(text: str) -> bool:
+    """Find the auditor's verdict, failing closed.
+
+    A live auditor does not always answer with exactly one line -- it may open
+    with a short preamble or wrap the verdict in formatting. Scan for the first
+    line that starts with a verdict token and take that. Anything unparseable
+    is a denial: a Policy Decision Point that cannot read its own answer must
+    not default to permitting the action.
+    """
+    for line in text.splitlines():
+        stripped = line.strip().lstrip("*#-> ").upper()
+        if stripped.startswith("ALLOW"):
+            return True
+        if stripped.startswith("DENY"):
+            return False
+    return False
