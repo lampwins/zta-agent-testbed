@@ -20,7 +20,7 @@ for.
 from __future__ import annotations
 
 import re
-from typing import List
+from typing import Callable, Dict, List, Sequence, Tuple
 
 from ztabed.core.policy import (
     ActionContext,
@@ -167,23 +167,12 @@ class SeenBeforeRule(PolicyDecisionPoint):
         return _allow(self.name, "nothing novel about this action")
 
 
-def naive_pdp() -> List[PolicyDecisionPoint]:
-    from ztabed.core.policy import AppliesTo
-
-    has_envelope = lambda c: c.sender_identity is not None  # noqa: E731
-    return [
-        BodyKeywordRule(),
-        AppliesTo(RecipientLiteralRule(), lambda c: _has_destination(c), "naive_recipient_literal"),
-        AmountCeilingRule(),
-        AppliesTo(SenderNameRule(), has_envelope, "naive_sender_name"),
-        ToolKeywordRule(),
-        FirstPartyOnlyRule(),
-        SeenBeforeRule(),
-    ]
-
-
 def _has_destination(ctx: ActionContext) -> bool:
     return any(f in ctx.call.arguments for f in RecipientLiteralRule.COUNTERPARTY_FIELDS)
+
+
+def _has_envelope(ctx: ActionContext) -> bool:
+    return ctx.sender_identity is not None
 
 
 # ── rule-based ZTA engine ────────────────────────────────────────────────────
@@ -301,19 +290,77 @@ class DataFlowIntegrityRule(PolicyDecisionPoint):
         )
 
 
-def zta_static_pdp() -> List[PolicyDecisionPoint]:
+# ── rule registry ────────────────────────────────────────────────────────────
+#
+# Every rule is addressable by name so an arm can be assembled, ablated, and
+# swept from the command line. The scoping predicate lives here rather than in
+# the rule so that an ablation adding a rule to a different arm gets the same
+# scoping it had in its own.
+
+_RULES: Dict[str, Callable[[], PolicyDecisionPoint]] = {}
+
+
+def _register(name: str, factory: Callable[[], PolicyDecisionPoint]) -> str:
+    _RULES[name] = factory
+    return name
+
+
+def _scoped(rule_cls, predicate, label):
     from ztabed.core.policy import AppliesTo
 
-    # Identity rules only apply where an inter-agent envelope exists; without one
-    # there is no claimed sender to verify, and scoping them prevents a blanket
-    # denial of every ordinary action.
-    has_envelope = lambda c: c.sender_identity is not None  # noqa: E731
-    return [
-        AppliesTo(ExplicitVerificationRule(), has_envelope, "zta_verify_explicitly"),
-        AppliesTo(ScopeAuthorizationRule(), has_envelope, "zta_scope_authorization"),
-        # Deliberately unscoped. Skipping tools that carry no attestation would
-        # fail open on precisely the registration an attacker crafts -- one that
-        # declares source=builtin and offers nothing to verify.
-        AttestationRule(),
-        DataFlowIntegrityRule(),
-    ]
+    return lambda: AppliesTo(rule_cls(), predicate, label)
+
+
+# Naive shortcut rules.
+R_BODY_KEYWORDS = _register("body_keywords", BodyKeywordRule)
+R_RECIPIENT_LITERAL = _register(
+    "recipient_literal", _scoped(RecipientLiteralRule, _has_destination, "naive_recipient_literal")
+)
+R_AMOUNT_CEILING = _register("amount_ceiling", AmountCeilingRule)
+R_SENDER_NAME = _register("sender_name", _scoped(SenderNameRule, _has_envelope, "naive_sender_name"))
+R_TOOL_KEYWORDS = _register("tool_keywords", ToolKeywordRule)
+R_FIRST_PARTY_ONLY = _register("first_party_only", FirstPartyOnlyRule)
+R_SEEN_BEFORE = _register("seen_before", SeenBeforeRule)
+
+# Zero Trust engine rules. The identity rules are scoped to actions carrying an
+# inter-agent envelope: without one there is no claimed sender to verify, and an
+# unscoped identity check would deny every ordinary action. The attestation rule
+# is deliberately unscoped -- skipping tools that carry no attestation fails open
+# on precisely the registration an attacker crafts.
+R_VERIFY_EXPLICITLY = _register(
+    "verify_explicitly", _scoped(ExplicitVerificationRule, _has_envelope, "zta_verify_explicitly")
+)
+R_SCOPE_AUTHZ = _register(
+    "scope_authorization", _scoped(ScopeAuthorizationRule, _has_envelope, "zta_scope_authorization")
+)
+R_ATTESTATION = _register("tool_attestation", AttestationRule)
+R_DATA_FLOW = _register("data_flow_integrity", DataFlowIntegrityRule)
+
+NAIVE_RULES: Tuple[str, ...] = (
+    R_BODY_KEYWORDS, R_RECIPIENT_LITERAL, R_AMOUNT_CEILING, R_SENDER_NAME,
+    R_TOOL_KEYWORDS, R_FIRST_PARTY_ONLY, R_SEEN_BEFORE,
+)
+ZTA_RULES: Tuple[str, ...] = (
+    R_VERIFY_EXPLICITLY, R_SCOPE_AUTHZ, R_ATTESTATION, R_DATA_FLOW,
+)
+
+
+def available_rules() -> List[str]:
+    return sorted(_RULES)
+
+
+def build_rules(names: Sequence[str]) -> List[PolicyDecisionPoint]:
+    out = []
+    for name in names:
+        if name not in _RULES:
+            raise KeyError(f"unknown rule {name!r}; available: {', '.join(available_rules())}")
+        out.append(_RULES[name]())
+    return out
+
+
+def naive_pdp() -> List[PolicyDecisionPoint]:
+    return build_rules(NAIVE_RULES)
+
+
+def zta_static_pdp() -> List[PolicyDecisionPoint]:
+    return build_rules(ZTA_RULES)

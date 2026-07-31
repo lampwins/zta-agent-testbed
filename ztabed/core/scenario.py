@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
 from .llm import LLMBackend
+from .payloads import PayloadSet, get_payload_set
 
 if TYPE_CHECKING:  # avoid a runtime dependency from core on the model layer
     from ztabed.core.agent import AgentTurnResult
@@ -42,9 +43,17 @@ class Scenario(ABC):
     name: str = "scenario"
     description: str = ""
 
-    def __init__(self, llm_mode: str = "mock", model_session: Optional["ModelSession"] = None):
+    def __init__(
+        self,
+        llm_mode: str = "mock",
+        model_session: Optional["ModelSession"] = None,
+        payloads: Optional["PayloadSet"] = None,
+    ):
         self.llm_mode = llm_mode
         self.model_session = model_session
+        # Injection texts are a parameter so a published construction can be
+        # substituted as a positive control; see ztabed.core.payloads.
+        self.payloads = payloads or get_payload_set(None)
 
     @property
     def is_real(self) -> bool:

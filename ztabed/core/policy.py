@@ -40,6 +40,9 @@ class PolicyDecision:
     principle: str = ""
     confidence: str = ""  # "low" | "medium" | "high" when the PDP reports one
     abstained: bool = False  # PDP could not decide; failed closed
+    # True when a scoping wrapper declined to apply the inner PDP. Distinct from
+    # an ALLOW: the PDP had no opinion rather than approving.
+    out_of_scope: bool = False
 
     @property
     def allowed(self) -> bool:
@@ -184,6 +187,93 @@ def evaluate_all(controls: List[PolicyDecisionPoint], ctx: ActionContext) -> Pol
     return PolicyDecision(Decision.ALLOW, "passed all policy checks", "+".join(c.name for c in controls))
 
 
+@dataclass
+class RuleVerdict:
+    """One PDP's independent verdict, recorded regardless of short-circuiting."""
+
+    pdp: str
+    decision: Decision
+    reason: str
+    principle: str = ""
+    in_scope: bool = True  # False when an AppliesTo wrapper skipped the inner PDP
+    confidence: str = ""
+    abstained: bool = False
+
+
+@dataclass
+class AuditedDecision:
+    """What enforcement did, plus what every PDP would have said on its own.
+
+    Enforcement has to short-circuit: the first DENY is final, and an expensive
+    PDP should never be consulted about a case a cheap one already refused. That
+    makes attribution impossible from enforcement alone -- with seven rules
+    composed, a denial names one of them and says nothing about the other six.
+    Audit mode answers the separate question of which rules would have fired,
+    without changing what enforcement does.
+    """
+
+    enforced: PolicyDecision
+    verdicts: List[RuleVerdict] = field(default_factory=list)
+
+    @property
+    def deniers(self) -> List[str]:
+        return [v.pdp for v in self.verdicts if v.decision is Decision.DENY]
+
+    @property
+    def challengers(self) -> List[str]:
+        return [v.pdp for v in self.verdicts if v.decision is Decision.CHALLENGE]
+
+
+def evaluate_audit(controls: List["PolicyDecisionPoint"], ctx: ActionContext) -> AuditedDecision:
+    """Evaluate every PDP and report both the enforced outcome and each verdict.
+
+    Costly for arms containing a model-backed PDP, because the model is consulted
+    even for cases a rule already settled. Free for deterministic arms, which is
+    where per-rule attribution is wanted.
+    """
+    verdicts: List[RuleVerdict] = []
+    # Keep the original decision objects alongside the recorded verdicts. A
+    # PolicyDecision carries more than a verdict -- `abstained` above all -- and
+    # rebuilding one from a RuleVerdict drops those fields silently, which would
+    # zero the abstention rate exactly when audit mode is used on a live arm.
+    decisions: List[PolicyDecision] = []
+    for control in controls:
+        decision = control.evaluate(ctx)
+        decisions.append(decision)
+        verdicts.append(
+            RuleVerdict(
+                pdp=control.name,
+                decision=decision.decision,
+                reason=decision.reason,
+                principle=decision.principle,
+                in_scope=not decision.out_of_scope,
+                confidence=decision.confidence,
+                abstained=decision.abstained,
+            )
+        )
+
+    # Reproduce enforcement semantics over the decisions already collected:
+    # identical ordering, identical objects, no PDP invoked twice.
+    enforced: Optional[PolicyDecision] = None
+    challenge: Optional[PolicyDecision] = None
+    for decision in decisions:
+        if decision.decision is Decision.DENY:
+            enforced = decision
+            break
+        if decision.decision is Decision.CHALLENGE and challenge is None:
+            challenge = decision
+    if enforced is None:
+        if challenge is not None:
+            enforced = challenge
+        elif controls:
+            enforced = PolicyDecision(
+                Decision.ALLOW, "passed all policy checks", "+".join(c.name for c in controls)
+            )
+        else:
+            enforced = PolicyDecision(Decision.ALLOW, "no PDP attached (baseline)", "none")
+    return AuditedDecision(enforced=enforced, verdicts=verdicts)
+
+
 class AppliesTo(PolicyDecisionPoint):
     """Scopes a single-purpose PDP to the actions it is meant to govern.
 
@@ -200,5 +290,7 @@ class AppliesTo(PolicyDecisionPoint):
 
     def evaluate(self, ctx: ActionContext) -> PolicyDecision:
         if not self.predicate(ctx):
-            return PolicyDecision(Decision.ALLOW, "action outside this PDP's scope", self.name)
+            return PolicyDecision(
+                Decision.ALLOW, "action outside this PDP's scope", self.name, out_of_scope=True
+            )
         return self.inner.evaluate(ctx)

@@ -5,7 +5,9 @@ import json
 import sys
 from pathlib import Path
 
+from ztabed.core.artifact import action_context_schema, write_artifact
 from ztabed.core.evaluate import PDPEvaluator, print_report
+from ztabed.core.payloads import get_payload_set, load_payload_file
 from ztabed.core.runner import ABRunner
 from ztabed.models import (
     AdapterUnavailable,
@@ -15,7 +17,17 @@ from ztabed.models import (
     available_providers,
     get_adapter,
 )
-from ztabed.pdp import ALL_ARMS, ARM_DESCRIPTIONS, arm_needs_model, build_arm
+from ztabed.pdp import (
+    ALL_ARMS,
+    ARM_DESCRIPTIONS,
+    PDP_SYSTEM_PROMPT,
+    VERDICT_SCHEMA,
+    arm_needs_model,
+    arm_rules,
+    available_rules,
+    build_arm,
+    render_action_context,
+)
 from ztabed.scenarios import ALL_SCENARIOS
 from ztabed.vectors import available_vectors, build_corpus
 
@@ -113,14 +125,43 @@ def main() -> None:
                            help="decisions per case; >1 measures a live PDP's self-consistency")
     judge_cmd.add_argument("--concurrency", type=int, default=1,
                            help="decisions to run in parallel (default: 1)")
+    judge_cmd.add_argument("--audit", action="store_true",
+                           help="evaluate every PDP instead of stopping at the first denial, giving "
+                                "per-rule attribution. Free for deterministic arms; multiplies calls "
+                                "for model-backed ones.")
+    judge_cmd.add_argument("--add-rule", action="append", default=[], choices=available_rules(),
+                           help="add a rule to every rule-based arm (ablation; repeatable)")
+    judge_cmd.add_argument("--drop-rule", action="append", default=[], choices=available_rules(),
+                           help="remove a rule from every rule-based arm (ablation; repeatable)")
     judge_cmd.add_argument("--save", action="store_true", help="Save raw per-decision results to results/")
     _add_model_args(judge_cmd)
+
+    ablate_cmd = subcommand(
+        "ablate",
+        help="Sweep one arm's rules, reporting what each rule buys and costs",
+    )
+    ablate_cmd.add_argument("--arm", default="zta_static", choices=list(ALL_ARMS),
+                            help="arm to ablate (default: zta_static)")
+    ablate_cmd.add_argument("--add-rule", action="append", default=[], choices=available_rules(),
+                            help="also sweep adding this rule (repeatable)")
+    ablate_cmd.add_argument("--vector", action="append", default=None, choices=available_vectors())
+    ablate_cmd.add_argument("--save", action="store_true")
+
+    export_cmd = subcommand("export", help="Write the corpus artifact (JSONL + manifest) for release")
+    export_cmd.add_argument("--out", default="artifact", help="output directory (default: artifact/)")
+
+    subcommand("schema", help="Emit the ActionContext schema, judge prompt, and verdict schema")
 
     run_cmd = subcommand("run", help="Run an A/B trial for one or all scenarios")
     run_cmd.add_argument("--scenario", default="all", choices=["all"] + list(ALL_SCENARIOS.keys()))
     run_cmd.add_argument("--trials", type=int, default=10, help="Trials per condition ({none,naive,zta} x {attack,benign})")
     run_cmd.add_argument("--concurrency", type=int, default=1,
                          help="trials to run in parallel; mainly useful for --mode real (default: 1)")
+    run_cmd.add_argument("--payload-set", default=None,
+                         help="named injection payload set (default: the built-in texts)")
+    run_cmd.add_argument("--payloads", default=None, metavar="FILE",
+                         help="load payload sets from a JSON file, so a published attack "
+                              "construction can be run as a positive control")
     run_cmd.add_argument("--save", action="store_true", help="Save raw per-trial results to results/")
     _add_model_args(run_cmd)
 
@@ -160,6 +201,75 @@ def main() -> None:
             raise SystemExit(1)
         return
 
+    if args.command == "ablate":
+        corpus = build_corpus(args.vector)
+        base = arm_rules(args.arm)
+        # Each variant is the arm with exactly one rule removed, plus the arm
+        # with each candidate rule added. Comparing a variant against the
+        # baseline isolates what that one rule contributes.
+        variants = [("baseline", (), ())]
+        variants += [(f"-{r}", (), (r,)) for r in base]
+        variants += [(f"+{r}", (r,), ()) for r in args.add_rule]
+
+        rows = []
+        for label, add, drop in variants:
+            res = PDPEvaluator(
+                corpus, [args.arm],
+                arm_factory=lambda a, _a=add, _d=drop: build_arm(a, None, add_rules=_a, drop_rules=_d),
+                audit=True,
+            ).run()
+            rows.append((label, res.arms[0]))
+
+        print(f"\n=== ablation of {args.arm} over {len(corpus)} cases ===")
+        print("Each row is the arm with one rule removed (-) or added (+), against the baseline.")
+        print("A rule earns its place only if its catches outweigh the legitimate work it refuses.\n")
+        head = f"{'variant':<26}{'miss':>18}{'FP':>18}{'bal.acc':>9}{'Δmiss':>8}{'ΔFP':>7}"
+        print(head)
+        print("-" * len(head))
+        base_metrics = rows[0][1]
+        for label, m in rows:
+            d_miss = m.miss.value - base_metrics.miss.value
+            d_fp = m.false_positive.value - base_metrics.false_positive.value
+            delta = "" if label == "baseline" else f"{d_miss:>+8.0%}{d_fp:>+7.0%}"
+            print(f"{label:<26}{m.miss.render():>18}{m.false_positive.render():>18}"
+                  f"{m.balanced_accuracy:>9.0%}{delta}")
+
+        print("\nper-rule attribution on the baseline arm")
+        print(f"  {'rule':<24}{'catches':>9}{'benignDENY':>12}  unique catches")
+        for a in base_metrics.rule_attribution:
+            print(f"  {a.rule:<24}{a.denied_malicious:>9}{a.denied_benign:>12}"
+                  f"  {', '.join(a.unique_catches) or '-'}")
+        return
+
+    if args.command == "export":
+        corpus = build_corpus()
+        problems = corpus.check()
+        if problems:
+            print("refusing to export a corpus with problems:", file=sys.stderr)
+            for p in problems:
+                print(f"  {p}", file=sys.stderr)
+            raise SystemExit(1)
+        out = Path(args.out)
+        paths = write_artifact(corpus, out)
+        for p in paths:
+            print(f"wrote {p}")
+        print(f"\ncorpus digest: {corpus.digest()}")
+        return
+
+    if args.command == "schema":
+        print(json.dumps({
+            "action_context_schema": action_context_schema(),
+            "verdict_schema": VERDICT_SCHEMA,
+            "pdp_system_prompt": PDP_SYSTEM_PROMPT,
+            "worked_example": {
+                "case_id": "exfil-m-hard-launder",
+                "rendered_evidence_packet": render_action_context(
+                    next(c for c in build_corpus() if c.case_id == "exfil-m-hard-launder").context
+                ),
+            },
+        }, indent=2))
+        return
+
     if args.command == "judge":
         arms = args.arm or ["none", "naive", "zta_static"]
         needs_model = any(arm_needs_model(a) for a in arms)
@@ -182,13 +292,18 @@ def main() -> None:
 
         corpus = build_corpus(args.vector)
         factory = (lambda: model_session.backend("pdp")) if model_session else None
+        add, drop = tuple(args.add_rule), tuple(args.drop_rule)
+        if (add or drop) and any(arm_needs_model(a) for a in arms) and args.audit:
+            print("note: --audit with a live arm consults the model on every case, "
+                  "including ones the rules already settled.", file=sys.stderr)
         evaluator = PDPEvaluator(
             corpus=corpus,
             arms=arms,
-            arm_factory=lambda arm: build_arm(arm, factory),
+            arm_factory=lambda arm: build_arm(arm, factory, add_rules=add, drop_rules=drop),
             repeats=args.repeats,
             concurrency=args.concurrency,
             model_session=model_session,
+            audit=args.audit,
         )
         try:
             result = evaluator.run()
@@ -226,6 +341,20 @@ def main() -> None:
                 print(f"error: {exc}", file=sys.stderr)
                 raise SystemExit(2)
 
+        if args.payloads:
+            loaded = load_payload_file(Path(args.payloads))
+            print(f"loaded payload sets: {', '.join(loaded)}")
+        try:
+            payloads = get_payload_set(args.payload_set)
+        except KeyError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            raise SystemExit(2)
+        if payloads.name == "builtin" and args.mode == "real":
+            print("note: using the built-in injection texts, which were written for this "
+                  "testbed. A 0% attack success rate against them is not evidence of model "
+                  "resistance without a published construction as a positive control "
+                  "(--payloads).", file=sys.stderr)
+
         names = list(ALL_SCENARIOS.keys()) if args.scenario == "all" else [args.scenario]
         results = []
         for name in names:
@@ -235,6 +364,7 @@ def main() -> None:
                 llm_mode=args.mode,
                 model_session=model_session,
                 concurrency=args.concurrency,
+                payloads=payloads,
             )
             results.append(runner.run_and_print(save_dir=RESULTS_DIR if args.save else None))
 

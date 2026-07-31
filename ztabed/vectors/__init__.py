@@ -6,6 +6,12 @@ builder with `@register_vector("name")` and importing it here.
 """
 from ztabed.core.corpus import available_vectors, build_corpus
 
-from . import agent_identity, injected_exfil, scope_escalation, tool_supply_chain  # noqa: F401
+from . import (  # noqa: F401
+    agent_identity,
+    injected_exfil,
+    memory_poisoning,
+    scope_escalation,
+    tool_supply_chain,
+)
 
 __all__ = ["available_vectors", "build_corpus"]

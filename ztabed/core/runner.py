@@ -84,15 +84,19 @@ class ABRunner:
         llm_mode: str = "mock",
         model_session=None,
         concurrency: int = 1,
+        payloads=None,
     ):
         self.scenario_cls = scenario_cls
         self.trials = trials
         self.llm_mode = llm_mode
         self.model_session = model_session
         self.concurrency = max(1, concurrency)
+        self.payloads = payloads
 
     def _run_trial(self, control_mode: str, attack: bool, seed: int) -> Outcome:
-        scenario = self.scenario_cls(llm_mode=self.llm_mode, model_session=self.model_session)
+        scenario = self.scenario_cls(
+            llm_mode=self.llm_mode, model_session=self.model_session, payloads=self.payloads
+        )
         try:
             return scenario.run(control_mode=control_mode, attack=attack, trial_seed=seed)
         except Exception as exc:  # a metered run should not lose completed work

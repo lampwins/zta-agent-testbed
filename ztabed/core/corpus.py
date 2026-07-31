@@ -20,6 +20,8 @@ obviously-benign benign cases makes any PDP look perfect.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -69,6 +71,13 @@ class ActionCase:
     # marking either as "wrong" would understate a PDP that reasoned soundly.
     also_acceptable: Tuple[str, ...] = ()
     defeats: str = ""
+    #: Links a case to its twin. Paired cases hold every surface feature constant
+    #: and differ only in the fact that authorises the action.
+    pair_id: str = ""
+    #: For a paired case, the single fact that decides it. Stating it explicitly
+    #: is what keeps a pair honest: if you cannot name one fact, the two cases
+    #: differ in more than one way and the pair proves nothing.
+    authorising_fact: str = ""
 
     @property
     def is_malicious(self) -> bool:
@@ -93,6 +102,8 @@ class ActionCase:
             "expected_principle": self.expected_principle,
             "also_acceptable": list(self.also_acceptable),
             "defeats": self.defeats,
+            "pair_id": self.pair_id,
+            "authorising_fact": self.authorising_fact,
             "rationale": self.rationale,
         }
 
@@ -133,6 +144,16 @@ class Corpus:
                 seen.append(case.vector)
         return tuple(seen)
 
+    def digest(self) -> str:
+        """Content hash of the corpus.
+
+        Stamped into every results file so a reported number can be tied to the
+        exact corpus that produced it -- and so a claim that difficulty labels
+        were fixed before a run is checkable rather than asserted.
+        """
+        payload = json.dumps([c.summary() for c in self.cases], sort_keys=True, default=str)
+        return "sha256:" + hashlib.sha256(payload.encode()).hexdigest()[:16]
+
     def balance(self) -> Dict[str, int]:
         out: Dict[str, int] = {}
         for case in self.cases:
@@ -166,6 +187,36 @@ class Corpus:
             per = self.filter(vector=vector).balance()
             if not per.get(BENIGN):
                 problems.append(f"{vector}: no benign cases -- false-positive rate is unmeasurable")
+
+        # Pairing is a claimed method, so its invariants are checked rather than
+        # trusted. A half-built pair is worse than no pair: it looks like
+        # evidence that surface features were held constant when they were not.
+        pairs: Dict[str, List[ActionCase]] = {}
+        for case in self.cases:
+            if case.pair_id:
+                pairs.setdefault(case.pair_id, []).append(case)
+        for pair_id, members in sorted(pairs.items()):
+            labels = sorted(c.label for c in members)
+            if labels != [BENIGN, MALICIOUS]:
+                problems.append(
+                    f"pair {pair_id}: expected one malicious and one benign case, got {labels}"
+                )
+                continue
+            malicious = next(c for c in members if c.is_malicious)
+            benign = next(c for c in members if not c.is_malicious)
+            if malicious.context.tool.name != benign.context.tool.name:
+                problems.append(
+                    f"pair {pair_id}: halves call different tools "
+                    f"({malicious.context.tool.name} vs {benign.context.tool.name}) -- a detector "
+                    f"can separate them on the tool alone"
+                )
+            if malicious.difficulty != benign.difficulty:
+                problems.append(f"pair {pair_id}: halves have different difficulty labels")
+            if not malicious.authorising_fact:
+                problems.append(
+                    f"pair {pair_id}: no authorising_fact -- if the deciding fact cannot be named, "
+                    f"the halves may differ in more than one way"
+                )
         return problems
 
 
