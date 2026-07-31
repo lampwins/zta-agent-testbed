@@ -23,12 +23,22 @@ RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
 
 
 def _add_model_args(parser: argparse.ArgumentParser) -> None:
+    """Shared live-model flags.
+
+    `--mode` lives here rather than on each subcommand so the two cannot drift
+    apart. It also has to be declared explicitly wherever `--model` exists:
+    argparse resolves unique prefixes, so an undeclared `--mode real` is silently
+    absorbed as `--model real` and a run goes out against a model of that name.
+    """
     group = parser.add_argument_group(
         "live model options (--mode real)",
         "effort and thinking change how much the model deliberates, which measurably "
         "changes how it handles injected instructions -- treat them as variables to "
         "sweep, not just cost knobs.",
     )
+    group.add_argument("--mode", default="mock", choices=["mock", "real"],
+                       help="mock = no model calls; real = use a live model. Required by "
+                            "`judge` arms that need a model, and selects the backend for `run`.")
     group.add_argument("--provider", default="anthropic", choices=available_providers(),
                        help="model adapter to use (default: anthropic)")
     group.add_argument("--model", default=None,
@@ -66,18 +76,32 @@ def _build_model_session(args) -> ModelSession:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="ztabed", description="Zero Trust agent security testbed: A/B attack scenarios.")
+    # Prefix abbreviation is disabled throughout. `--mode` is a unique prefix of
+    # `--model`, so with abbreviation on argparse silently reads `--mode real` as
+    # `--model real`, and a metered run goes out against a model that does not
+    # exist -- recording the wrong configuration in the saved results. A testbed
+    # whose job is measurement should never quietly reinterpret its own flags.
+    # Subparsers do not inherit this from the top-level parser, so it is passed
+    # to each one via `subcommand()`.
+    parser = argparse.ArgumentParser(
+        prog="ztabed",
+        description="Zero Trust agent security testbed: PDP evaluation and agent-loop A/B trials.",
+        allow_abbrev=False,
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("list", help="List available scenarios, corpus vectors, and PDP arms")
-    sub.add_parser("models", help="List registered model adapters and the models they know about")
+    def subcommand(name: str, **kwargs) -> argparse.ArgumentParser:
+        return sub.add_parser(name, allow_abbrev=False, **kwargs)
 
-    corpus_cmd = sub.add_parser("corpus", help="Inspect or export the labelled ActionContext corpus")
+    subcommand("list", help="List available scenarios, corpus vectors, and PDP arms")
+    subcommand("models", help="List registered model adapters and the models they know about")
+
+    corpus_cmd = subcommand("corpus", help="Inspect or export the labelled ActionContext corpus")
     corpus_cmd.add_argument("--vector", action="append", default=None,
                             choices=available_vectors(), help="restrict to a vector (repeatable)")
     corpus_cmd.add_argument("--json", action="store_true", help="emit the corpus as JSON")
 
-    judge_cmd = sub.add_parser(
+    judge_cmd = subcommand(
         "judge",
         help="Replay the labelled corpus through PDP arms (the live-model evaluation)",
     )
@@ -92,11 +116,9 @@ def main() -> None:
     judge_cmd.add_argument("--save", action="store_true", help="Save raw per-decision results to results/")
     _add_model_args(judge_cmd)
 
-    run_cmd = sub.add_parser("run", help="Run an A/B trial for one or all scenarios")
+    run_cmd = subcommand("run", help="Run an A/B trial for one or all scenarios")
     run_cmd.add_argument("--scenario", default="all", choices=["all"] + list(ALL_SCENARIOS.keys()))
     run_cmd.add_argument("--trials", type=int, default=10, help="Trials per condition ({none,naive,zta} x {attack,benign})")
-    run_cmd.add_argument("--mode", default="mock", choices=["mock", "real"],
-                         help="mock = deterministic scripted agents, real = live model calls")
     run_cmd.add_argument("--concurrency", type=int, default=1,
                          help="trials to run in parallel; mainly useful for --mode real (default: 1)")
     run_cmd.add_argument("--save", action="store_true", help="Save raw per-trial results to results/")

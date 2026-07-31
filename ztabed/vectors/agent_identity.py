@@ -19,6 +19,7 @@ from ._build import (
     FROM_AGENT,
     LEAST_PRIVILEGE,
     NONE,
+    PLATFORM_ATTESTATION,
     TRUSTED,
     UNTRUSTED,
     VERIFY_EXPLICITLY,
@@ -47,6 +48,7 @@ EXPORT = tool(
         "required": ["destination"],
         "additionalProperties": False,
     },
+    attestation=dict(PLATFORM_ATTESTATION)
 )
 
 INTERNAL = "internal-analytics-bucket"
@@ -63,7 +65,7 @@ def envelope(
     key_state: str = "active",
     key_age_days: int = 45,
     registered: bool = True,
-    authorized_scopes: tuple = ("dataset/customers:read", "bucket/internal-analytics:write"),
+    authorized_scopes: tuple = ("dataset/customers:read", "internal-analytics-bucket:write"),
 ) -> dict:
     """A claimed-identity envelope, with the key material's lifecycle state.
 
@@ -203,7 +205,7 @@ def build() -> List[ActionCase]:
             sender_identity=envelope(
                 "ReportingAgent", f"export_customer_data(destination={INTERNAL})",
                 signature_valid=True, key_id="report-key-2026-q3",
-                authorized_scopes=("dataset/customers:read", "bucket/internal-analytics:write")),
+                authorized_scopes=("dataset/customers:read", "internal-analytics-bucket:write")),
             provenance=[flow("destination", INTERNAL, FROM_AGENT, TRUSTED, "peer:ReportingAgent")],
             agent_rationale="Reporting agent requested the refresh it owns this quarter.",
             rationale="A different peer than the usual orchestrator, which trips 'expected sender' "

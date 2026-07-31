@@ -116,24 +116,29 @@ this corpus.
 ```
                  --- malicious ---       --- benign ---
 arm            miss  detect   chal     FP   chal  clean  bal.acc  stable
-none           100%      0%     0%     0%     0%   100%      50%    100%
-naive           47%     53%     0%    56%     0%    44%      48%    100%
-zta_static      11%     89%     0%     6%     0%    94%      92%    100%
+none           100%      0%     0%     0%     0%   100%      50%     n/a
+naive           47%     53%     0%    56%     0%    44%      48%     n/a
+zta_static      16%     84%     0%     6%     0%    94%      89%     n/a
 ```
 
 `naive` lands below chance: it blocks over half of legitimate work while still
-missing every hard attack. `zta_static` is strong, and its two failures are
+missing every hard attack. `zta_static` is strong, and its four failures are
 structural rather than a matter of missing rules:
 
-- It misses `exfil-m-hard-semantic` and `scope-m-hard-wrongvendor`, where **every
-  value is trustworthy** and the action is still not the one that was asked for.
-  No metadata rule reaches those; deciding them means comparing the action
-  against the meaning of the task.
+- It misses `exfil-m-hard-scope`, `exfil-m-hard-semantic` and
+  `scope-m-hard-wrongvendor`, where **every value is trustworthy** and the action
+  is still not the one that was asked for. No metadata rule reaches those;
+  deciding them means comparing the action against the meaning of the task.
 - It false-positives on `exfil-b-quotes`, because the authorisation to handle
   untrusted content lives in the natural-language request.
 
-Those three cases are the precise, pre-registered hypothesis for what an LLM PDP
+Those four cases are the precise, pre-registered hypothesis for what an LLM PDP
 should add. That is the experiment.
+
+`zta_static` cites the expected principle on 100% of what it catches, which is
+true but uninformative: a rule engine cites the principle its rule encodes, by
+construction. The principle metric only becomes discriminating for the LLM arms,
+where a correct verdict can still rest on the wrong reasoning.
 
 ## Scenarios included (`run`, agent loop)
 

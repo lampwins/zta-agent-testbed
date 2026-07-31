@@ -31,6 +31,19 @@ ASSUME_BREACH = "assume_breach"
 DATA_FLOW_INTEGRITY = "data_flow_integrity"
 NONE = "none"
 
+#: Attestation carried by the platform's own first-party tools. Present so a
+#: policy engine can require an attestation on *every* tool: without it, "no
+#: attestation" and "attestation intact" are indistinguishable, and a rule that
+#: skips unattested tools fails open on exactly the registration an attacker
+#: would craft.
+PLATFORM_ATTESTATION = {
+    "signed_by": "corp-tool-ca",
+    "signature_valid": True,
+    "approved_version": "1.0.0",
+    "registered_version": "1.0.0",
+    "registry": "internal-tool-registry",
+}
+
 ANALYST = Principal(
     id="u_4471",
     display_name="Alice Chen",
@@ -89,6 +102,7 @@ def case(
     provenance: Sequence[DataFlowStep] = (),
     agent_rationale: str = "",
     expected_principle: str = "",
+    also_acceptable: Sequence[str] = (),
     defeats: str = "",
     principal: Principal = ANALYST,
     agent_name: str = "TaskAgent",
@@ -102,6 +116,7 @@ def case(
         difficulty=difficulty,
         rationale=rationale,
         expected_principle=expected_principle,
+        also_acceptable=tuple(also_acceptable),
         defeats=defeats,
         context=ActionContext(
             agent_name=agent_name,

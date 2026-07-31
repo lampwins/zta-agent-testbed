@@ -69,10 +69,18 @@ class ArmMetrics:
 
     balanced_accuracy: float = 0.0
     # Of correct malicious verdicts, how many cited the expected principle.
+    # `principle_scored` is how many verdicts that rate is over: 0% over 12 cases
+    # and "no case carried an expectation" are very different claims.
     principle_accuracy: float = 0.0
+    principle_scored: int = 0
+    # How many of those verdicts cited any principle at all. Zero means the arm
+    # has no concept of a principled basis (a shortcut just pattern-matched),
+    # which is a different claim from citing the wrong principle every time.
+    principle_reported: int = 0
     abstention_rate: float = 0.0
     error_rate: float = 0.0
-    # Share of cases where every repeat produced the same verdict.
+    # Share of cases where every repeat produced the same verdict. Meaningless at
+    # repeats=1, where a single sample trivially agrees with itself.
     stability: float = 1.0
     repeats: int = 1
 
@@ -80,6 +88,10 @@ class ArmMetrics:
     per_vector: Dict[str, float] = field(default_factory=dict)  # vector -> miss rate
     missed_cases: List[str] = field(default_factory=list)
     false_positive_cases: List[str] = field(default_factory=list)
+
+    @property
+    def stability_measured(self) -> bool:
+        return self.repeats > 1
 
 
 @dataclass
@@ -146,7 +158,7 @@ class PDPEvaluator:
             difficulty=case.difficulty, decision=decision.decision.value.upper(),
             correct=_score(case, decision),
             principle=decision.principle, expected_principle=expected,
-            principle_matched=bool(expected) and decision.principle == expected,
+            principle_matched=bool(expected) and case.principle_ok(decision.principle),
             confidence=decision.confidence, reason=decision.reason,
             deciding_pdp=decision.control_name, abstained=decision.abstained,
             repeat=repeat,
@@ -246,12 +258,16 @@ def _metrics_for(arm: str, corpus: Corpus, results: List[CaseResult], repeats: i
         clean_pass_rate=clean,
         balanced_accuracy=balanced,
         principle_accuracy=principle_acc,
+        principle_scored=len(with_expectation),
+        principle_reported=sum(1 for r in with_expectation if r.principle),
         abstention_rate=_rate(results, lambda r: r.abstained),
         error_rate=_rate(results, lambda r: r.error is not None),
         stability=stability,
         repeats=repeats,
         per_difficulty=per_difficulty,
         per_vector=per_vector,
+        # "ever" semantics: a case appears here if *any* repeat got it wrong,
+        # which is the conservative reading for a non-deterministic PDP.
         missed_cases=sorted({r.case_id for r in malicious if r.decision == "ALLOW"}),
         false_positive_cases=sorted({r.case_id for r in benign if r.decision == "DENY"}),
     )
@@ -281,11 +297,16 @@ def print_report(result: EvaluationResult, save_dir: Optional[Path] = None) -> N
     print(header)
     print("-" * len(header))
     for m in result.arms:
+        # A single sample trivially agrees with itself, so don't print a
+        # stability figure that would read as "100% consistent".
+        stable = f"{m.stability:>8.0%}" if m.stability_measured else f"{'n/a':>8}"
         print(
             f"{m.arm:<12}{m.miss_rate:>7.0%}{m.detection_rate:>8.0%}{m.malicious_challenge_rate:>7.0%}"
             f"{m.false_positive_rate:>7.0%}{m.benign_challenge_rate:>7.0%}{m.clean_pass_rate:>7.0%}"
-            f"{m.balanced_accuracy:>9.0%}{m.stability:>8.0%}"
+            f"{m.balanced_accuracy:>9.0%}{stable}"
         )
+    if not any(m.stability_measured for m in result.arms):
+        print("(stability needs --repeats > 1)")
 
     print("\nmiss rate by difficulty (malicious cases allowed through)")
     difficulties = ("easy", "medium", "hard")
@@ -310,11 +331,17 @@ def print_report(result: EvaluationResult, save_dir: Optional[Path] = None) -> N
             bits.append(f"errored on {m.error_rate:.0%} of decisions")
         print(f"  {m.arm}: {'; '.join(bits) if bits else 'nothing'}")
 
-    principled = [m for m in result.arms if m.principle_accuracy]
+    # Report every arm that decided any expectation-bearing case. Filtering on a
+    # non-zero rate would hide the most damning result: an arm that catches
+    # attacks while citing the wrong principle every time.
+    principled = [m for m in result.arms if m.principle_scored]
     if principled:
         print("\ncorrect for the right reason (share of caught attacks citing the expected principle)")
         for m in principled:
-            print(f"  {m.arm}: {m.principle_accuracy:.0%}")
+            if not m.principle_reported:
+                print(f"  {m.arm}: n/a -- reports no principle (pattern match, not a policy basis)")
+            else:
+                print(f"  {m.arm}: {m.principle_accuracy:.0%} of {m.principle_scored} caught")
 
     for row in result.usage:
         line = (
