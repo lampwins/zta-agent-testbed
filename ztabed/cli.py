@@ -21,12 +21,18 @@ from ztabed.pdp import (
     ALL_ARMS,
     ARM_DESCRIPTIONS,
     PDP_SYSTEM_PROMPT,
+    PROMPT_VARIANTS,
+    STEERING_CLAUSES,
     VERDICT_SCHEMA,
     arm_needs_model,
     arm_rules,
+    available_clauses,
     available_rules,
     build_arm,
+    build_pdp_prompt,
+    prompt_digest,
     render_action_context,
+    resolve_prompt,
 )
 from ztabed.scenarios import ALL_SCENARIOS
 from ztabed.vectors import available_vectors, build_corpus
@@ -133,6 +139,12 @@ def main() -> None:
                            help="add a rule to every rule-based arm (ablation; repeatable)")
     judge_cmd.add_argument("--drop-rule", action="append", default=[], choices=available_rules(),
                            help="remove a rule from every rule-based arm (ablation; repeatable)")
+    judge_cmd.add_argument("--prompt-variant", default="full", choices=sorted(PROMPT_VARIANTS),
+                           help="judge-prompt preset for the live arms (default: full, the "
+                                "published prompt)")
+    judge_cmd.add_argument("--drop-clause", action="append", default=[], choices=available_clauses(),
+                           help="remove a steering clause from the judge prompt on top of the "
+                                "chosen variant (repeatable)")
     judge_cmd.add_argument("--save", action="store_true", help="Save raw per-decision results to results/")
     _add_model_args(judge_cmd)
 
@@ -151,6 +163,13 @@ def main() -> None:
     export_cmd.add_argument("--out", default="artifact", help="output directory (default: artifact/)")
 
     subcommand("schema", help="Emit the ActionContext schema, judge prompt, and verdict schema")
+
+    prompts_cmd = subcommand(
+        "prompts", help="Show the judge prompt's ablatable clauses and its variants")
+    prompts_cmd.add_argument("--variant", default=None, choices=sorted(PROMPT_VARIANTS),
+                             help="print the full text of one variant")
+    prompts_cmd.add_argument("--drop-clause", action="append", default=[],
+                             choices=available_clauses())
 
     run_cmd = subcommand("run", help="Run an A/B trial for one or all scenarios")
     run_cmd.add_argument("--scenario", default="all", choices=["all"] + list(ALL_SCENARIOS.keys()))
@@ -199,6 +218,30 @@ def main() -> None:
             for problem in problems:
                 print(f"  {problem}", file=sys.stderr)
             raise SystemExit(1)
+        return
+
+    if args.command == "prompts":
+        if args.variant or args.drop_clause:
+            prompt, label, dropped = resolve_prompt(args.variant or "full", args.drop_clause)
+            print(f"# variant: {label}")
+            print(f"# digest:  {prompt_digest(prompt)}")
+            print(f"# dropped: {', '.join(dropped) or 'none'}\n")
+            print(prompt)
+            return
+        print("Steering clauses in the judge prompt")
+        print("Each was added to stop the model reducing to the matching deterministic rule,")
+        print("which makes each one a candidate explanation for the model arm's advantage.\n")
+        for c in STEERING_CLAUSES:
+            print(f"  {c.key}  (principle: {c.principle})")
+            print(f"    text:      {c.text().strip()}")
+            print(f"    rationale: {c.rationale}\n")
+        print("Variants")
+        for name in sorted(PROMPT_VARIANTS):
+            prompt = build_pdp_prompt(PROMPT_VARIANTS[name])
+            dropped = ", ".join(PROMPT_VARIANTS[name]) or "none"
+            marker = "  <- published prompt" if name == "full" else ""
+            print(f"  {name:<18} {prompt_digest(prompt)}  {len(prompt):>5} chars  "
+                  f"dropped: {dropped}{marker}")
         return
 
     if args.command == "ablate":
@@ -261,6 +304,20 @@ def main() -> None:
             "action_context_schema": action_context_schema(),
             "verdict_schema": VERDICT_SCHEMA,
             "pdp_system_prompt": PDP_SYSTEM_PROMPT,
+            "pdp_prompt_digest": prompt_digest(PDP_SYSTEM_PROMPT),
+            "pdp_prompt_variants": {
+                name: {
+                    "dropped_clauses": list(PROMPT_VARIANTS[name]),
+                    "digest": prompt_digest(build_pdp_prompt(PROMPT_VARIANTS[name])),
+                    "prompt": build_pdp_prompt(PROMPT_VARIANTS[name]),
+                }
+                for name in sorted(PROMPT_VARIANTS)
+            },
+            "steering_clauses": [
+                {"key": c.key, "principle": c.principle, "text": c.text(),
+                 "rationale": c.rationale}
+                for c in STEERING_CLAUSES
+            ],
             "worked_example": {
                 "case_id": "exfil-m-hard-launder",
                 "rendered_evidence_packet": render_action_context(
@@ -293,17 +350,33 @@ def main() -> None:
         corpus = build_corpus(args.vector)
         factory = (lambda: model_session.backend("pdp")) if model_session else None
         add, drop = tuple(args.add_rule), tuple(args.drop_rule)
+        try:
+            judge_prompt, prompt_label, clauses_dropped = resolve_prompt(
+                args.prompt_variant, args.drop_clause
+            )
+        except KeyError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            raise SystemExit(2)
+        if clauses_dropped and not needs_model:
+            print("note: --prompt-variant/--drop-clause only affect the live arms "
+                  f"({', '.join(a for a in ALL_ARMS if arm_needs_model(a))}); none selected.",
+                  file=sys.stderr)
         if (add or drop) and any(arm_needs_model(a) for a in arms) and args.audit:
             print("note: --audit with a live arm consults the model on every case, "
                   "including ones the rules already settled.", file=sys.stderr)
         evaluator = PDPEvaluator(
             corpus=corpus,
             arms=arms,
-            arm_factory=lambda arm: build_arm(arm, factory, add_rules=add, drop_rules=drop),
+            arm_factory=lambda arm: build_arm(
+                arm, factory, add_rules=add, drop_rules=drop, system_prompt=judge_prompt
+            ),
             repeats=args.repeats,
             concurrency=args.concurrency,
             model_session=model_session,
             audit=args.audit,
+            prompt_variant=prompt_label,
+            prompt_digest=prompt_digest(judge_prompt),
+            prompt_clauses_dropped=clauses_dropped,
         )
         try:
             result = evaluator.run()

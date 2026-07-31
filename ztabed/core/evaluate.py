@@ -185,6 +185,11 @@ class EvaluationResult:
     usage: List[dict] = field(default_factory=list)
     estimated_cost_usd: float = 0.0
     audit_mode: bool = False
+    #: Which judge-prompt variant produced these numbers, and its content hash.
+    #: A reported result must never be separable from the prompt behind it.
+    prompt_variant: Optional[str] = None
+    prompt_digest: Optional[str] = None
+    prompt_clauses_dropped: List[str] = field(default_factory=list)
 
 
 def _score(case: ActionCase, verdict: str) -> bool:
@@ -213,6 +218,9 @@ class PDPEvaluator:
         concurrency: int = 1,
         model_session=None,
         audit: bool = False,
+        prompt_variant: Optional[str] = None,
+        prompt_digest: Optional[str] = None,
+        prompt_clauses_dropped: Sequence[str] = (),
     ):
         self.corpus = corpus
         self.arms = arms
@@ -221,6 +229,9 @@ class PDPEvaluator:
         self.concurrency = max(1, concurrency)
         self.model_session = model_session
         self.audit = audit
+        self.prompt_variant = prompt_variant
+        self.prompt_digest = prompt_digest
+        self.prompt_clauses_dropped = list(prompt_clauses_dropped)
 
     def _decide(self, pdps: List[PolicyDecisionPoint], case: ActionCase, repeat: int) -> CaseResult:
         try:
@@ -303,6 +314,9 @@ class PDPEvaluator:
             usage=usage_rows,
             estimated_cost_usd=cost,
             audit_mode=self.audit,
+            prompt_variant=self.prompt_variant,
+            prompt_digest=self.prompt_digest,
+            prompt_clauses_dropped=list(self.prompt_clauses_dropped),
         )
 
     def _model_calls(self) -> int:
@@ -519,6 +533,10 @@ def print_report(result: EvaluationResult, save_dir: Optional[Path] = None) -> N
     print(f"unit of analysis: case (majority vote over {repeats} repeat(s)); 95% Wilson intervals")
     if result.audit_mode:
         print("audit mode: every PDP evaluated (enforcement semantics unchanged)")
+    if result.prompt_variant:
+        dropped = ", ".join(result.prompt_clauses_dropped) or "none"
+        print(f"judge prompt: {result.prompt_variant} ({result.prompt_digest}); "
+              f"steering clauses dropped: {dropped}")
 
     print("\n── primary rates, per case ──")
     header = f"{'arm':<12}{'miss':>18}{'FP':>18}{'clean':>18}{'bal.acc':>9}{'friction':>10}{'stable':>8}"

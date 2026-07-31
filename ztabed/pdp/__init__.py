@@ -15,7 +15,20 @@ from .arms import (
     build_arm,
 )
 from .baselines import NAIVE_RULES, ZTA_RULES, available_rules, build_rules, naive_pdp, zta_static_pdp
-from .llm_judge import PDP_SYSTEM_PROMPT, VERDICT_SCHEMA, LLMJudgePDP, render_action_context
+from .llm_judge import (
+    PDP_SYSTEM_PROMPT,
+    PROMPT_VARIANTS,
+    STEERING_CLAUSES,
+    VERDICT_SCHEMA,
+    LLMJudgePDP,
+    SteeringClause,
+    available_clauses,
+    build_pdp_prompt,
+    clause_rationales,
+    prompt_digest,
+    render_action_context,
+    resolve_prompt,
+)
 
 __all__ = [
     "ALL_ARMS",
@@ -28,10 +41,18 @@ __all__ = [
     "ChallengeDowngrade",
     "LLMJudgePDP",
     "PDP_SYSTEM_PROMPT",
+    "PROMPT_VARIANTS",
+    "STEERING_CLAUSES",
+    "SteeringClause",
     "VERDICT_SCHEMA",
     "arm_needs_model",
     "arm_rules",
+    "available_clauses",
     "available_rules",
+    "build_pdp_prompt",
+    "clause_rationales",
+    "prompt_digest",
+    "resolve_prompt",
     "build_arm",
     "build_rules",
     "naive_pdp",

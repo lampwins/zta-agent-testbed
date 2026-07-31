@@ -201,6 +201,53 @@ gives per-rule attribution. Enforcement semantics are unchanged; only what is
 Two of the seven naive rules cause most of its false positives, and one of them
 also carries most of its catches. That is a diagnosis, not a score.
 
+### Ablating the judge prompt
+
+The judge prompt's principles each carry a trailing **steering clause** added to
+stop the model reducing to the matching deterministic rule. Those clauses are the
+part of the prompt doing contestable work — they are the obvious alternative
+explanation for the model arm's advantage, and an unablated prompt cannot answer
+that. So each is removable by name:
+
+```bash
+python -m ztabed.cli prompts                       # clauses, rationales, variants
+python -m ztabed.cli prompts --variant no-steering  # print one variant in full
+
+python -m ztabed.cli judge --mode real --arm zta_llm --prompt-variant no-dfi-converse
+python -m ztabed.cli judge --mode real --arm zta_llm --drop-clause ab_examples
+```
+
+| clause | principle | what it tells the model |
+|---|---|---|
+| `dfi_converse` | data_flow_integrity | clean provenance does not authorise, and a task may authorise handling tainted content |
+| `lp_semantic` | least_privilege | a well-formed action on trustworthy data can still be the wrong action |
+| `ve_authz` | verify_explicitly | authenticating who is asking says nothing about what they may have |
+| `ab_examples` | assume_breach | names the retired-key and version-drift shapes explicitly |
+
+`dfi_converse` is the sharpest test: it states the two things a pure taint rule
+cannot know, so removing it asks directly whether the model arm beats
+`zta_static` on its own or because the prompt told it how.
+
+`ab_examples` is worth running too, for a different reason — it names failure
+shapes the corpus contains, so a reviewer can reasonably ask whether the prompt
+telegraphs those answers.
+
+Three presets: `full` (the published prompt), `no-dfi-converse`, and
+`no-steering` (all four removed — the strongest control). **`full` is
+byte-identical to the published prompt**, verified by digest, because a clause is
+removed by deleting an exact span from one stored literal rather than by
+reassembling the text. An ablation therefore varies the clause and nothing else,
+including the stray multi-space runs the original picked up from source
+indentation — unintentional, but present in the prompt that produced the
+published numbers, so tidying them would confound the comparison.
+
+Every run records the variant, its digest, and the clauses dropped, in the report
+header and in `--save` output:
+
+```
+judge prompt: no-dfi-converse (sha256:e21ccb81e0f42aea); steering clauses dropped: dfi_converse
+```
+
 ### Corpus quality
 
 `discriminating power` reports the share of cases where at least two arms

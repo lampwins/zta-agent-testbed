@@ -87,6 +87,7 @@ def build_arm(
     backend_factory: Optional[Callable[[], object]] = None,
     add_rules: Tuple[str, ...] = (),
     drop_rules: Tuple[str, ...] = (),
+    system_prompt: Optional[str] = None,
 ) -> List[PolicyDecisionPoint]:
     """Assemble an arm, optionally with rules added or removed.
 
@@ -114,7 +115,13 @@ def build_arm(
 
     if backend_factory is None:
         raise ValueError(f"arm {arm!r} needs a live model backend; pass --mode real")
-    judge = LLMJudgePDP(backend_factory())
+    # `system_prompt` carries the prompt variant under test. Omitted means the
+    # published prompt; see ztabed.pdp.llm_judge for the ablatable clauses.
+    judge = (
+        LLMJudgePDP(backend_factory(), system_prompt=system_prompt)
+        if system_prompt is not None
+        else LLMJudgePDP(backend_factory())
+    )
 
     if arm == "zta_llm":
         return [judge]
