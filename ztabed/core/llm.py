@@ -38,6 +38,11 @@ class LLMTurnRequest:
     system: str
     history: List[Message]
     tools: List[ToolSpec] = field(default_factory=list)
+    # Provider-neutral request for a schema-constrained reply. Adapters map it
+    # onto whatever structured-output mechanism the provider offers; mock
+    # backends ignore it. Used by the LLM-backed PDP so a verdict is parsed
+    # rather than scraped out of prose.
+    response_schema: Optional[dict] = None
 
 
 @dataclass

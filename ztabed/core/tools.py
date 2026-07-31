@@ -68,14 +68,22 @@ class ToolSpec:
 
     name: str
     description: str
-    handler: Callable[..., "ToolResult"]
+    # None for a declarative corpus case, where nothing is executed and the tool
+    # is only a description of what *would* have run.
+    handler: Optional[Callable[..., "ToolResult"]] = None
     source: str = "builtin"
     trust_level: str = "trusted"  # "trusted" | "unverified" | "untrusted"
     parameters: Optional[Dict[str, Any]] = None
+    # Supply-chain metadata: how the registration itself was vouched for.
+    # e.g. {"signed_by": "corp-ca", "approved_version": "1.2.0",
+    #       "registered_version": "1.3.1", "signature_valid": True}
+    attestation: Dict[str, Any] = field(default_factory=dict)
 
     def input_schema(self) -> Dict[str, Any]:
         if self.parameters is not None:
             return self.parameters
+        if self.handler is None:
+            return {"type": "object", "properties": {}, "additionalProperties": True}
         return schema_from_signature(self.handler)
 
 

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
+from ztabed.core.evaluate import PDPEvaluator, print_report
 from ztabed.core.runner import ABRunner
 from ztabed.models import (
     AdapterUnavailable,
@@ -13,7 +15,9 @@ from ztabed.models import (
     available_providers,
     get_adapter,
 )
+from ztabed.pdp import ALL_ARMS, ARM_DESCRIPTIONS, arm_needs_model, build_arm
 from ztabed.scenarios import ALL_SCENARIOS
+from ztabed.vectors import available_vectors, build_corpus
 
 RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
 
@@ -65,8 +69,28 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="ztabed", description="Zero Trust agent security testbed: A/B attack scenarios.")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("list", help="List available scenarios")
+    sub.add_parser("list", help="List available scenarios, corpus vectors, and PDP arms")
     sub.add_parser("models", help="List registered model adapters and the models they know about")
+
+    corpus_cmd = sub.add_parser("corpus", help="Inspect or export the labelled ActionContext corpus")
+    corpus_cmd.add_argument("--vector", action="append", default=None,
+                            choices=available_vectors(), help="restrict to a vector (repeatable)")
+    corpus_cmd.add_argument("--json", action="store_true", help="emit the corpus as JSON")
+
+    judge_cmd = sub.add_parser(
+        "judge",
+        help="Replay the labelled corpus through PDP arms (the live-model evaluation)",
+    )
+    judge_cmd.add_argument("--arm", action="append", default=None, choices=list(ALL_ARMS),
+                           help="PDP arm to evaluate (repeatable; default: all offline arms)")
+    judge_cmd.add_argument("--vector", action="append", default=None, choices=available_vectors(),
+                           help="restrict the corpus to a vector (repeatable)")
+    judge_cmd.add_argument("--repeats", type=int, default=1,
+                           help="decisions per case; >1 measures a live PDP's self-consistency")
+    judge_cmd.add_argument("--concurrency", type=int, default=1,
+                           help="decisions to run in parallel (default: 1)")
+    judge_cmd.add_argument("--save", action="store_true", help="Save raw per-decision results to results/")
+    _add_model_args(judge_cmd)
 
     run_cmd = sub.add_parser("run", help="Run an A/B trial for one or all scenarios")
     run_cmd.add_argument("--scenario", default="all", choices=["all"] + list(ALL_SCENARIOS.keys()))
@@ -81,8 +105,80 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "list":
+        print("corpus vectors (for `judge` -- the live-model evaluation)")
+        for name in available_vectors():
+            count = len(build_corpus([name]))
+            print(f"  {name:<22}{count} labelled cases")
+        print("\nPDP arms")
+        for arm in ALL_ARMS:
+            tag = " (needs --mode real)" if arm_needs_model(arm) else ""
+            print(f"  {arm:<22}{ARM_DESCRIPTIONS[arm]}{tag}")
+        print("\nagent-loop scenarios (for `run` -- best used with --mode mock)")
         for name, cls in ALL_SCENARIOS.items():
-            print(f"{name:<22}{cls.description}")
+            print(f"  {name:<22}{cls.description}")
+        return
+
+    if args.command == "corpus":
+        corpus = build_corpus(args.vector)
+        problems = corpus.check()
+        if args.json:
+            print(json.dumps([c.summary() for c in corpus], indent=2))
+        else:
+            for case in corpus:
+                flag = "MAL " if case.is_malicious else "ben "
+                print(f"{flag}{case.case_id:<28}{case.difficulty:<8}{case.context.tool.name}")
+                print(f"     {case.rationale}")
+                if case.defeats:
+                    print(f"     defeats: {case.defeats}")
+            print(f"\n{len(corpus)} cases: {corpus.balance()}")
+        if problems:
+            print("\ncorpus problems:", file=sys.stderr)
+            for problem in problems:
+                print(f"  {problem}", file=sys.stderr)
+            raise SystemExit(1)
+        return
+
+    if args.command == "judge":
+        arms = args.arm or ["none", "naive", "zta_static"]
+        needs_model = any(arm_needs_model(a) for a in arms)
+
+        model_session = None
+        if needs_model:
+            if args.mode != "real":
+                print(
+                    f"error: arm(s) {[a for a in arms if arm_needs_model(a)]} need a live model; "
+                    "pass --mode real",
+                    file=sys.stderr,
+                )
+                raise SystemExit(2)
+            try:
+                model_session = _build_model_session(args)
+                model_session.backend("pdp")
+            except AdapterUnavailable as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                raise SystemExit(2)
+
+        corpus = build_corpus(args.vector)
+        factory = (lambda: model_session.backend("pdp")) if model_session else None
+        evaluator = PDPEvaluator(
+            corpus=corpus,
+            arms=arms,
+            arm_factory=lambda arm: build_arm(arm, factory),
+            repeats=args.repeats,
+            concurrency=args.concurrency,
+            model_session=model_session,
+        )
+        try:
+            result = evaluator.run()
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            raise SystemExit(1)
+        print_report(result, save_dir=RESULTS_DIR if args.save else None)
+
+        stalled = [m.arm for m in result.arms if m.error_rate >= 1.0]
+        if stalled:
+            print(f"\nerror: no decisions completed for arm(s): {', '.join(stalled)}", file=sys.stderr)
+            raise SystemExit(1)
         return
 
     if args.command == "models":

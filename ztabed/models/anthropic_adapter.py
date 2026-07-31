@@ -209,13 +209,27 @@ class AnthropicAdapter(ModelAdapter):
         }
         if req.tools:
             kwargs["tools"] = self._tool_schemas(req.tools)
+
+        # effort and structured output share output_config, so build it up rather
+        # than letting one overwrite the other.
+        output_config: Dict[str, Any] = {}
         if cfg.effort is not None:
-            kwargs["output_config"] = {"effort": cfg.effort}
+            output_config["effort"] = cfg.effort
+        if req.response_schema is not None:
+            output_config["format"] = {"type": "json_schema", "schema": req.response_schema}
+        if output_config:
+            kwargs["output_config"] = output_config
+
         if cfg.thinking is not None:
             kwargs["thinking"] = {"type": cfg.thinking}
         if cfg.temperature is not None:
             kwargs["temperature"] = cfg.temperature
-        kwargs.update(cfg.extra)
+
+        for key, value in cfg.extra.items():
+            if key == "output_config" and isinstance(value, dict):
+                kwargs.setdefault("output_config", {}).update(value)
+            else:
+                kwargs[key] = value
         return kwargs
 
     # ── the call ─────────────────────────────────────────────────────────────

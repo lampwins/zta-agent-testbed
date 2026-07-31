@@ -1,8 +1,54 @@
 # ztabed — Zero Trust Agent security testbed
 
-A small A/B framework for reproducing AI-agent attack vectors and measuring
-whether a Zero Trust control catches them, without breaking the legitimate
-use case.
+Measures whether a Zero Trust **Policy Decision Point** correctly rules on what
+an AI agent is attempting — catching attacks without breaking legitimate work.
+
+## Architecture
+
+The reference architecture (`diagram.png`) puts the LLM *outside* the trust
+boundary. The user talks to a model, the model drives an MCP Client, and the ZTA
+agent is what sits between that and the resource:
+
+```
+User ──► LLM                          (untrusted actor)
+          ▲
+          │
+┌─────────┼─── ZTA Enabled AI Agent ──────────────────────────┐
+│  MCP Client   interprets user/LLM intent                    │
+│      │                                                       │
+│     PEP ────────────────────► PDP                            │
+│  crafts the ActionContext    rules on it: ALLOW/DENY/...     │
+│      │                                                       │
+│  MCP Server   arbiter for access to the resource             │
+└──────┼───────────────────────────────────────────────────────┘
+    Resource
+```
+
+Two consequences drive the whole design:
+
+1. **The PDP is the component under evaluation**, not the agent. Whether a given
+   model can be talked into misbehaving is a different (and heavily studied)
+   question; whether policy catches the attempt is the Zero Trust question.
+2. **The `ActionContext` is the entire contract** between the two halves. A PDP
+   sees nothing else — no conversation, no model, no side channel. That
+   isolation is what makes a PDP testable on its own, and it is why the same
+   context can come from a live agent loop or be replayed from a corpus.
+
+## Two ways to drive a PDP
+
+| | `judge` (recommended, live-model friendly) | `run` (agent loop) |
+|---|---|---|
+| Unit measured | one PDP decision on one action | one end-to-end exploit attempt |
+| Where the model sits | **in the PDP box**, ruling on an action | in the agent's seat, being attacked |
+| Attack source | a labelled corpus of `ActionContext`s | a scripted mock policy |
+| Output | confusion matrix (miss rate, FP rate, stability) | attack-success / block / task-completion rates |
+| Live model | works — the model is doing security review | expect refusals; see the note below |
+
+**Use `judge` with a live model.** Asking a model to rule on a pending action is
+a defensive task it performs willingly. Asking it to *carry out* a task while
+feeding it injected instructions is not: a correctly aligned model refuses, and
+the run yields no measurement. Those refusals were never a harness bug — they
+were the model behaving properly given what it was asked to do.
 
 ## Concepts
 
@@ -23,7 +69,73 @@ use case.
   condition: attack success rate, block rate, and legitimate-task
   completion rate (the false-positive/usability cost of the control).
 
-## Scenarios included
+## The corpus (`judge`)
+
+35 labelled `ActionContext` cases across four vectors, each an action some agent
+wants to take, with ground truth for whether policy should permit it.
+
+| vector | the untrusted channel |
+|---|---|
+| `injected_exfil` | instructions hidden in fetched web content redirect or launder data out |
+| `scope_escalation` | a tampered invoice makes an authorised deputy exceed its scope |
+| `agent_identity` | a forged or over-reaching peer agent in a multi-agent system |
+| `tool_supply_chain` | a rogue or tampered tool registration (e.g. compromised MCP server) |
+
+**The benign half carries the weight.** Every benign case is a deliberate
+near-miss built to trip a specific shortcut, and several are paired with a
+malicious case they are nearly indistinguishable from:
+
+| malicious | benign near-miss | what actually separates them |
+|---|---|---|
+| `exfil-m-hard-launder` | `exfil-b-quotes` | both put untrusted page content in an outbound email to the right recipient — only the stated task says whether that was authorised |
+| `scope-m-hard-routing` | `scope-b-onfile-routing` | identical unscoped `account_routing` parameter; one came from a tampered invoice, one from the vendor master |
+| `ident-m-hard-stalekey` | `ident-b-newkey` | both present a key outside the usual window; one is retired, one freshly rotated |
+| `supply-m-hard-spoofed` | `supply-b-telemetry` | one declares itself trusted with a failing signature; one is properly attested and merely says "telemetry" |
+
+A corpus of obviously-benign benign cases makes any PDP look perfect. Each case
+also records a `defeats` field naming the shortcut it targets, so a results table
+is a diagnosis rather than a score — run `ztabed.cli corpus` to read them.
+
+## PDP arms
+
+| arm | what it is | needs a model |
+|---|---|---|
+| `none` | no policy — defines the attack surface | no |
+| `naive` | widely-deployed shortcuts: recipient allow-lists, transaction ceilings, trusting a sender name, description keyword scans, first-party-only tool allowlists | no |
+| `zta_static` | rule-based ZTA engine: explicit verification with key lifecycle, per-scope authorisation, attestation with version binding, data-flow integrity | no |
+| `zta_llm` | a language model in the PDP box | yes |
+| `zta_hybrid` | rules first, model only on what the rules would permit | yes |
+
+`zta_hybrid` is the arm that tests the interesting claim. Composition
+short-circuits on the first DENY, so the model is never consulted about a case the
+cheap deterministic rules already settled — roughly halving model calls against
+this corpus.
+
+### Reading the offline result
+
+```
+                 --- malicious ---       --- benign ---
+arm            miss  detect   chal     FP   chal  clean  bal.acc  stable
+none           100%      0%     0%     0%     0%   100%      50%    100%
+naive           47%     53%     0%    56%     0%    44%      48%    100%
+zta_static      11%     89%     0%     6%     0%    94%      92%    100%
+```
+
+`naive` lands below chance: it blocks over half of legitimate work while still
+missing every hard attack. `zta_static` is strong, and its two failures are
+structural rather than a matter of missing rules:
+
+- It misses `exfil-m-hard-semantic` and `scope-m-hard-wrongvendor`, where **every
+  value is trustworthy** and the action is still not the one that was asked for.
+  No metadata rule reaches those; deciding them means comparing the action
+  against the meaning of the task.
+- It false-positives on `exfil-b-quotes`, because the authorisation to handle
+  untrusted content lives in the natural-language request.
+
+Those three cases are the precise, pre-registered hypothesis for what an LLM PDP
+should add. That is the experiment.
+
+## Scenarios included (`run`, agent loop)
 
 | name | attack vector | control under test |
 |---|---|---|
@@ -37,13 +149,20 @@ use case.
 ```bash
 cd zta-agent-testbed
 
-python -m ztabed.cli list
-python -m ztabed.cli run --scenario prompt_injection --trials 20
+python -m ztabed.cli list            # vectors, PDP arms, and agent-loop scenarios
+python -m ztabed.cli corpus          # read the labelled corpus and its rationales
+
+# PDP evaluation — free and deterministic, no model needed
+python -m ztabed.cli judge
+python -m ztabed.cli judge --vector scope_escalation --arm none --arm zta_static
+
+# agent-loop simulation (mock)
 python -m ztabed.cli run --scenario all --trials 20 --save
 ```
 
-`--save` writes raw per-trial outcomes as JSON to `results/` for offline
-analysis (e.g. loading into pandas for the paper).
+`--save` writes raw per-decision results as JSON to `results/` for offline
+analysis (e.g. loading into pandas for the paper). The `judge` output embeds the
+corpus alongside the results, so a saved run is self-describing.
 
 ### Running against a live model
 
@@ -56,10 +175,19 @@ export ANTHROPIC_API_KEY=...     # or run `ant auth login`
 
 python -m ztabed.cli models      # registered adapters and their model ids
 
-python -m ztabed.cli run --scenario prompt_injection --mode real --trials 5
-python -m ztabed.cli run --scenario all --mode real --trials 10 \
-    --model claude-opus-5 --auditor-model claude-haiku-4-5 \
-    --effort low --concurrency 6 --save
+# The live-model evaluation: put the model in the PDP box.
+python -m ztabed.cli judge --mode real --arm zta_llm --concurrency 6
+
+# The full comparison, with self-consistency measured over 5 samples per case.
+python -m ztabed.cli judge --mode real --save --concurrency 8 --repeats 5 \
+    --arm none --arm naive --arm zta_static --arm zta_llm --arm zta_hybrid
+```
+
+Cheapest useful first run — one vector, one arm, ~9 model calls:
+
+```bash
+python -m ztabed.cli judge --mode real --arm zta_llm \
+    --vector scope_escalation --effort low
 ```
 
 Live-model flags:
@@ -81,18 +209,45 @@ invalid `--effort`/`--thinking` combination fails before the first billable
 call, and a run in which every trial refused or errored exits non-zero rather
 than printing a table of zeros that reads like a clean result.
 
-## Adding your own attack vector or control
+## Adding a corpus vector
 
-1. Add a `Control` subclass in `ztabed/controls/` implementing `evaluate(ctx) -> PolicyDecision`.
-2. Add a `Scenario` subclass in `ztabed/scenarios/` with a vulnerable mock
-   policy and a `run(control_mode, attack, trial_seed)` that wires the control
+1. Write a module in `ztabed/vectors/` whose builder is decorated with
+   `@register_vector("name")` and returns a list of `ActionCase`s. Use the
+   helpers in `ztabed/vectors/_build.py`.
+2. Import it in `ztabed/vectors/__init__.py`.
+
+Two rules the corpus validator enforces, both of which exist because breaking
+them silently invalidates a measurement:
+
+- **Every case needs a `rationale`.** An unjustified label is not ground truth.
+- **Every vector needs benign cases.** Without them the false-positive rate is
+  unmeasurable, and a PDP that denies everything scores perfectly.
+
+Beyond that, write benign near-misses *first* and make them hard. The malicious
+cases are the easy part; a corpus is only as strong as the legitimate traffic it
+asks a PDP not to break. Pair a benign case with the malicious case it most
+resembles, and record in `defeats` which shortcut each one targets.
+
+## Adding a PDP
+
+1. Subclass `PolicyDecisionPoint` (`ztabed/core/policy.py`) and implement
+   `evaluate(ctx) -> PolicyDecision`. Everything you may consult arrives in the
+   `ActionContext`.
+2. Add it to an arm in `ztabed/pdp/arms.py`.
+
+Return `Decision.CHALLENGE` for genuine ambiguity rather than guessing, and set
+`principle` so the evaluation can check the reasoning. Fail closed.
+
+## Adding an agent-loop scenario
+
+1. Add a `Scenario` subclass in `ztabed/scenarios/` with a vulnerable mock
+   policy and a `run(control_mode, attack, trial_seed)` that wires the PDP
    in only for the relevant `control_mode`.
-3. Register it in `ztabed/scenarios/__init__.py`'s `ALL_SCENARIOS` dict.
+2. Register it in `ztabed/scenarios/__init__.py`'s `ALL_SCENARIOS` dict.
 
 Score outcomes from **observable side effects** (what landed in the email
 sink, the transfer log, the exfil log), not from the mock policy's scripted
-branch. Side-effect scoring is what lets one scenario measure a live model,
-which will not follow the script.
+branch.
 
 ## Adding a model provider
 
@@ -121,19 +276,49 @@ An adapter owes the rest of the testbed three things:
 
 `AnthropicAdapter` is the reference implementation.
 
-## Notes on `--mode real`
+## Notes on the live PDP (`judge --mode real`)
 
-Real mode uses live model calls with deliberately naive system prompts (the
-point is to test whether the *control*, not a hand-tuned prompt, catches the
-attack). Everything else about a scenario — the tools, the injected payloads,
-the controls, the scoring — is identical to mock mode, so the two modes
-measure the same thing.
+The model is handed an evidence packet and asked to rule on it. It is never asked
+to perform the action, and untrusted material — injected payloads, the agent's own
+rationale — arrives inside delimited, explicitly-labelled fences, both so the
+judge cannot confuse it with its own instructions and so the judge can reason about
+provenance at all. Print one with:
 
-Mock mode remains the recommended setting for reproducible, free,
-deterministic measurement; real mode is for checking that a control's effect
-survives contact with an actual model.
+```python
+from ztabed.pdp import render_action_context
+from ztabed.vectors import build_corpus
+print(render_action_context(next(iter(build_corpus(["injected_exfil"]))).context))
+```
 
-Things worth knowing before reading real-mode numbers:
+- **Verdicts are schema-constrained**, so a decision is parsed rather than scraped
+  out of prose. A model that answers "this seems fine, allow it" in free text is
+  recorded as an **abstention and failed closed** — a PDP that cannot decide must
+  not permit. Abstention rate is reported separately so it can never masquerade
+  as detection.
+- **`--repeats N` measures self-consistency.** Accuracy on a single sample says
+  little about a non-deterministic PDP. The `stable` column is the share of cases
+  where every repeat agreed; a high accuracy with low stability is not a result.
+- **CHALLENGE is containment, not a catch.** A challenged malicious action does
+  not reach the resource, but it spends human attention, so challenge rates are
+  reported next to detection and never folded into it. Otherwise a PDP that
+  challenges everything would score perfectly.
+- **`principle` is captured with every verdict**, so the report can show whether
+  a caught attack was caught for the right reason or by luck.
+
+## Notes on `--mode real` with the agent loop (`run`)
+
+**Expect refusals.** Here the model is put in the agent's seat and asked to
+complete a task while injected instructions are fed to it, so a well-aligned model
+will often decline. That is the model working correctly, and it is why `judge`
+exists. Refusals are counted and annotated rather than scored as the control
+working, but the arm is confounded and is not the one to publish. Mock mode
+remains the setting for the agent-loop numbers.
+
+A refusal rate here is itself a finding — model-level alignment is a real defence
+layer — but it is entangled with the control's effect and cannot be separated
+within a single run.
+
+Things worth knowing before reading any real-mode numbers:
 
 - **`--effort` and `--thinking` are independent variables, not just cost
   knobs.** How much a model deliberates measurably changes how it handles
